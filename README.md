@@ -84,6 +84,7 @@ flips the content status `analyzed → under review`, and appends an `appeal`
 audit entry beside the original decision. The original verdict is preserved but
 no longer presented as final.
 
+```
  ── APPEAL FLOW ───────────────────────────────────────────────────
  ┌────────┐  {content_id, reasoning}  ┌──────────────────┐
  │ Client │ ────────────────────────▶ │  Flask  /appeal   │
