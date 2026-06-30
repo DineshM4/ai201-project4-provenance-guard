@@ -393,3 +393,6 @@ of the stored audit log for the original submission, *not* re-run the detectors.
 The spec is explicit that an appeal must preserve the original verdict, and I
 wanted a reviewer judging against the exact numbers the system first produced — so
 I verified the evidence was being read back from storage rather than recomputed.
+
+
+**Video Demo:** https://www.loom.com/share/c28b3a89941b4d4cbeb6c9c9596cb822
