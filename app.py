@@ -1,15 +1,22 @@
-"""Provenance Guard — Flask app (submission flow, Signal 1 only).
+"""Provenance Guard — Flask app (full API surface).
 
-Implements the submission half of the API contract (planning.md Appendix):
-POST /submit, GET /health, GET /content/<id>, GET /log. Detection currently
-runs Signal 1 (stylometric heuristics) only; Signal 2 (Groq LLM judge) is not
-wired in yet, so every decision degrades gracefully to the single-signal path:
-p_llm = null, p_final = p_style, confidence capped at 0.70 (planning.md §2).
+Implements the API contract (planning.md Appendix):
 
-The appeal workflow (POST /appeal, GET /appeals) is a separate milestone and is
-not included here.
+  Submission flow:  POST /submit, GET /content/<id>, GET /log, GET /health
+  Appeal flow:      POST /appeal, GET /appeals
+
+Detection runs both signals: Signal 1 (stylometric heuristics, local) and
+Signal 2 (Groq LLM judge), blended by scoring.combine into p_final/confidence.
+If the Groq judge is unavailable (no key / timeout / error), Signal 2 is skipped
+and the system degrades gracefully to the single-signal path: p_llm = null,
+p_final = p_style, confidence capped at 0.70 (planning.md §1/§2).
+
+The appeal flow touches Storage only — it never re-classifies. It writes an
+appeals row, flips the content status analyzed -> under review, and appends an
+"appeal" audit entry beside the original decision (planning.md §4).
 """
 
+from dotenv import load_dotenv
 from flask import Flask, jsonify, request
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
@@ -17,7 +24,10 @@ from flask_limiter.util import get_remote_address
 import storage
 from detector import score_stylometric
 from labels import make_label
+from llm_judge import score_llm
 from scoring import combine
+
+load_dotenv()
 
 app = Flask(__name__)
 
@@ -50,10 +60,10 @@ def submit():
     if not isinstance(text, str) or not text.strip():
         return jsonify({"error": "missing or empty 'text'"}), 400
 
-    # Signal 1 only — Signal 2 (Groq LLM) is not built yet, so p_llm stays None
-    # and combine() runs the single-signal path (cap 0.70).
+    # Two independent signals. Signal 2 returns (None, None) when the Groq judge
+    # is unavailable, in which case combine() runs the single-signal path (cap 0.70).
     p_style = score_stylometric(text)
-    p_llm = None
+    p_llm, rationale = score_llm(text)
     scored = combine(p_style, p_llm)
     label = make_label(scored["result"], scored["confidence"])
 
@@ -62,6 +72,7 @@ def submit():
         "confidence": scored["confidence"],
         "p_style": p_style,
         "p_llm": p_llm,
+        "rationale": rationale,
         "p_final": scored["p_final"],
         "label_text": label["label_text"],
         "label_variant": label["label_variant"],
@@ -77,7 +88,7 @@ def submit():
             "label_variant": label["label_variant"],
             "signals": {
                 "p_style": round(p_style, 4),
-                "p_llm": p_llm,
+                "p_llm": round(p_llm, 4) if p_llm is not None else None,
                 "p_final": round(scored["p_final"], 4),
             },
             "status": "analyzed",
@@ -101,6 +112,41 @@ def get_content(content_id):
     )
 
 
+@app.route("/appeal", methods=["POST"])
+def appeal():
+    data = request.get_json(silent=True) or {}
+    content_id = data.get("content_id")
+    reasoning = data.get("reasoning")
+    if not isinstance(content_id, str) or not content_id:
+        return jsonify({"error": "missing 'content_id'"}), 400
+    if not isinstance(reasoning, str) or not reasoning.strip():
+        return jsonify({"error": "missing or empty 'reasoning'"}), 400
+
+    created = storage.create_appeal(content_id, reasoning)
+    if created is None:
+        return jsonify({"error": "unknown content_id"}), 400
+
+    appeal_id, _submitted_at = created
+    return jsonify(
+        {
+            "content_id": content_id,
+            "status": "under review",
+            "appeal_id": appeal_id,
+            "message": (
+                "Your appeal has been received. This content is now under review; "
+                "the original automated estimate is preserved but no longer "
+                "presented as final."
+            ),
+        }
+    )
+
+
+@app.route("/appeals", methods=["GET"])
+def appeals():
+    status = request.args.get("status", "open")
+    return jsonify({"appeals": storage.get_appeals(status)})
+
+
 @app.route("/log", methods=["GET"])
 def get_log():
     content_id = request.args.get("content_id")
@@ -108,4 +154,4 @@ def get_log():
 
 
 if __name__ == "__main__":
-    app.run(host="127.0.0.1", port=5000, debug=True)
+    app.run(host="127.0.0.1", port=5000, debug=False)

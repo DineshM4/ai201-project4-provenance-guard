@@ -15,3 +15,8 @@ env/
 
 # SQLite database
 provenance.db
+
+text.json
+text2.json
+text3.json
+text4.json

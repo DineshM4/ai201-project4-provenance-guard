@@ -1,12 +1,13 @@
 """Storage (SQLite, stdlib) — persists every decision and its audit trail.
 
-Holds the `content` row (the decision + its current status) and an `audit_log`
-entry beside it (planning.md "Architecture", submission flow). The `appeals`
-table belongs to the appeal workflow and is not created here yet.
+Holds the `content` row (the decision + its current status), the `appeals` row
+(one per submitted appeal), and an `audit_log` entry beside each event
+(planning.md "Architecture").
 
-SQLite is chosen over a flat file because appeals must later mutate a content
-row's status by content_id while leaving the original decision intact
-(planning.md "Decisions / trade-offs").
+SQLite is chosen over a flat file because appeals must mutate a content row's
+status by content_id (`analyzed → under review`) while leaving the original
+decision and its audit-log entry intact beside it (planning.md "Decisions /
+trade-offs").
 """
 
 import json
@@ -44,6 +45,17 @@ def init_db():
                 label_variant  TEXT NOT NULL,
                 status         TEXT NOT NULL,
                 created_at     TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS appeals (
+                appeal_id     TEXT PRIMARY KEY,
+                content_id    TEXT NOT NULL,
+                reasoning     TEXT NOT NULL,
+                submitted_at  TEXT NOT NULL,
+                status        TEXT NOT NULL
             )
             """
         )
@@ -99,6 +111,7 @@ def create_content(text, decision):
                 "confidence": decision["confidence"],
                 "p_style": decision["p_style"],
                 "p_llm": decision["p_llm"],
+                "rationale": decision.get("rationale"),
                 "p_final": decision["p_final"],
                 "label_variant": decision["label_variant"],
             },
@@ -144,3 +157,88 @@ def get_log(content_id=None):
         }
         for r in rows
     ]
+
+
+def create_appeal(content_id, reasoning):
+    """Record an appeal (Storage only — no re-classification; planning.md §4).
+
+    Atomically: validate the content exists, insert an "open" appeals row, flip
+    the content status analyzed -> under review, and append an "appeal" audit
+    entry beside the original decision. Returns (appeal_id, submitted_at), or
+    None if the content_id is unknown (caller returns 400).
+    """
+    with _connect() as conn:
+        exists = conn.execute(
+            "SELECT 1 FROM content WHERE content_id = ?", (content_id,)
+        ).fetchone()
+        if exists is None:
+            return None
+
+        appeal_id = uuid.uuid4().hex
+        submitted_at = _now()
+        conn.execute(
+            "INSERT INTO appeals (appeal_id, content_id, reasoning, submitted_at, status) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (appeal_id, content_id, reasoning, submitted_at, "open"),
+        )
+        # Original verdict is preserved; only the status changes (planning.md §4).
+        conn.execute(
+            "UPDATE content SET status = ? WHERE content_id = ?",
+            ("under review", content_id),
+        )
+        _append_audit(
+            conn,
+            event_type="appeal",
+            content_id=content_id,
+            details={"appeal_id": appeal_id, "content_id": content_id,
+                     "submitted_at": submitted_at},
+        )
+    return appeal_id, submitted_at
+
+
+def get_appeals(status="open"):
+    """Reviewer queue: one row per appeal with the given status (planning.md §4).
+
+    Joins the appeal with its content row (original verdict + current status)
+    and the original "submit" audit entry (both signal scores + LLM rationale),
+    so the reviewer sees the full evidence without re-running detection.
+    """
+    with _connect() as conn:
+        appeals = conn.execute(
+            "SELECT * FROM appeals WHERE status = ? ORDER BY submitted_at", (
+                status,)
+        ).fetchall()
+
+        queue = []
+        for a in appeals:
+            content = conn.execute(
+                "SELECT * FROM content WHERE content_id = ?", (a["content_id"],)
+            ).fetchone()
+            audit = conn.execute(
+                "SELECT details FROM audit_log WHERE content_id = ? AND event_type = 'submit' "
+                "ORDER BY id LIMIT 1",
+                (a["content_id"],),
+            ).fetchone()
+            details = json.loads(
+                audit["details"]) if audit and audit["details"] else {}
+
+            text = content["text"] if content else ""
+            excerpt = text if len(text) <= 240 else text[:240].rstrip() + "…"
+
+            queue.append(
+                {
+                    "appeal_id": a["appeal_id"],
+                    "content_id": a["content_id"],
+                    "text_excerpt": excerpt,
+                    "result": content["result"] if content else None,
+                    "confidence": round(content["confidence"], 2) if content else None,
+                    "label_variant": content["label_variant"] if content else None,
+                    "p_style": details.get("p_style"),
+                    "p_llm": details.get("p_llm"),
+                    "rationale": details.get("rationale"),
+                    "reasoning": a["reasoning"],
+                    "status": content["status"] if content else None,
+                    "submitted_at": a["submitted_at"],
+                }
+            )
+    return queue
