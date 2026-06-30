@@ -12,3 +12,6 @@ env/
 
 # macOS
 .DS_Store
+
+# SQLite database
+provenance.db
